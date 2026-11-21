@@ -9,15 +9,41 @@ from fastapi import FastAPI, File, Form, HTTPException, UploadFile
 from pydantic import ValidationError
 
 from . import __version__
-from .imaging import ImageDecodeError, decode_grayscale_png
-from .models import MAX_IMAGES, MAX_PAIRS, MIN_IMAGES, AlignResponse, AlignSpec
+from .imaging import THUMBNAIL_MAX_SIDE, ImageDecodeError, decode_grayscale_png
+from .models import (
+    MAX_IMAGES,
+    MAX_PAIRS,
+    MIN_IMAGES,
+    AlignResponse,
+    AlignSpec,
+    ThumbnailResponse,
+)
 from .service import align
+from .thumbnail import BiLevelError
+from .thumbnail_service import make_thumbnail
 
 DESCRIPTION = """
 把一张大幅图纸切块扫描后，用**已声明的重叠图对**与各自的整数平移搜索窗，
+确定各块在整张图上的位置；另提供把二值图纸缩成小块缩略图的接口。
+
+### 缩略图 `POST /thumbnail`
+把一张二值图纸缩成尽量小的分块缩略图，同时保持黑色笔画的分离与闭合轮廓：
+
+* 输入：**8 位灰度 PNG**（颜色类型 0、非隔行、每边 ≤ 256 像素），像素只能取
+  0（黑）或 255（白）。
+* 缩小倍数 `s` 取 2～6 的整数；按 `s x s` 从左上角分块，右边、下边不足一块的
+  补白。全图共用一个阈值 `t`（正整数，1 ≤ t ≤ s*s）：块内黑点数 ≥ t 时输出黑点，
+  否则白点。
+* 黑色按八邻接、白色按四邻接；图外视为连成一片的白底。按原像素所在块关联两图
+  的同色区域，黑、白区域（含外部白底）都必须一一对应，`(s, t)` 才合格。
+* 取合格的最大 `s`（同一 `s` 下取最小 `t`）。2～6 全不合格时返回
+  `status=keep_original`，不给图，提示保留原图。
+
+### 对齐 `POST /align`
+把一张大幅图纸切块扫描后，用**已声明的重叠图对**与各自的整数平移搜索窗，
 确定各块在整张图上的位置。
 
-### 输入
+#### 输入
 * `images`：3～5 张 **8 位灰度 PNG**（颜色类型 0、非隔行、每边 ≤ 1024 像素）。
   上传顺序即图号 0..n-1，图 0 为定位基准。
 * `spec`：JSON 字符串，见下方 schema。包含
@@ -27,19 +53,19 @@ DESCRIPTION = """
   - `min_overlap_pixels`：整组共用的最少重叠像素数；
   - `max_mean_abs_diff`：整组共用的平均绝对灰度差上限。
 
-### 坐标约定
+#### 坐标约定
 第 i 张图左上角在图面上的坐标为 `(x_i, y_i)`；图对 `(a, b)` 的平移 `(dx, dy)`
 表示 **b 的左上角位于 a 的坐标 `(dx, dy)`** 处，即
 `(x_b, y_b) = (x_a + dx, y_a + dy)`。返回坐标以首图左上角为 `(0, 0)`。
 
-### 结果
+#### 结果
 * `aligned`：所有图对同时达标且相对布局唯一，返回各图位置与拼接外框。
 * `disconnected`：有图块无法经指定图对连到首图；`rescan_image_id` 指出建议补扫的一块。
 * `no_solution`：无法同时对齐；`failing_pairs` 给出未达标图对及原因。
 * `ambiguous`：多组位置方案都达标；`uncertain_image_ids` 指出位置不确定的图，
   `alternative_layouts` 给出至少两组示例。
 
-### 示例 spec
+#### 示例 spec
 ```json
 {
   "pairs": [
@@ -99,17 +125,55 @@ def _parse_spec(spec_text: str, n_images: int) -> AlignSpec:
 
 
 MAX_UPLOAD_BYTES = 16 * 1024 * 1024  # per tile; a 1024x1024 gray PNG is far below this
+MAX_THUMBNAIL_BYTES = 2 * 1024 * 1024  # a 256x256 bi-level PNG is a few KiB
 
 
-def _read_upload(upload: UploadFile, idx: int) -> bytes:
+def _read_upload(upload: UploadFile, idx: int, limit: int = MAX_UPLOAD_BYTES) -> bytes:
     """Read one upload with a hard size cap so a huge file cannot exhaust RAM."""
-    data = upload.file.read(MAX_UPLOAD_BYTES + 1)
-    if len(data) > MAX_UPLOAD_BYTES:
+    data = upload.file.read(limit + 1)
+    if len(data) > limit:
         raise HTTPException(
             status_code=400,
-            detail=f"图 {idx} 超过 {MAX_UPLOAD_BYTES // (1024 * 1024)} MiB 上限",
+            detail=f"图 {idx} 超过 {limit // (1024 * 1024)} MiB 上限",
         )
     return data
+
+
+@app.post(
+    "/thumbnail",
+    response_model=ThumbnailResponse,
+    tags=["thumbnail"],
+    summary="把二值图纸缩成保持区域一一对应的最小分块缩略图",
+    response_description=(
+        "status=reduced 时给出最大缩小倍数、共用阈值与缩略图 PNG（base64）；"
+        "status=keep_original 时不返回图，提示保留原图"
+    ),
+    responses={
+        400: {"description": "请求格式或图像不符合要求"},
+        422: {"description": "参数校验未通过（由 FastAPI 生成）"},
+    },
+)
+def thumbnail_endpoint(
+    image: Annotated[
+        UploadFile,
+        File(description="8 位灰度 PNG（颜色类型 0、非隔行、每边 ≤ 256 像素），像素仅 0/255"),
+    ],
+) -> ThumbnailResponse:
+    ctype = (image.content_type or "").split(";")[0].strip().lower()
+    if ctype not in ("image/png", "application/octet-stream", ""):
+        raise HTTPException(
+            status_code=400,
+            detail=f"Content-Type 为 {image.content_type!r}，只接受 image/png",
+        )
+    data = _read_upload(image, 0, MAX_THUMBNAIL_BYTES)
+    try:
+        decoded = decode_grayscale_png(0, data, max_side=THUMBNAIL_MAX_SIDE)
+    except ImageDecodeError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+    try:
+        return make_thumbnail(decoded.array)
+    except BiLevelError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
 
 
 @app.post(

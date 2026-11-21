@@ -152,6 +152,65 @@ class MosaicBounds(BaseModel):
     height: int
 
 
+class ThumbnailSourceInfo(BaseModel):
+    width: int = Field(description="上传图宽度（像素）")
+    height: int = Field(description="上传图高度（像素）")
+    black_pixels: int = Field(description="值为 0 的像素数")
+    white_pixels: int = Field(description="值为 255 的像素数")
+    black_regions: int = Field(description="原图黑色区域数（八邻接）")
+    enclosed_white_regions: int = Field(
+        description="原图被黑像素包围的白色区域数（白像素四邻接）"
+    )
+
+
+class ThumbnailGridInfo(BaseModel):
+    factor: int = Field(description="缩小倍数（每个方向取 s 个像素作为一块）")
+    threshold: int = Field(description="全图共用的正整数阈值")
+    block_pixels: int = Field(description="每块像素数 s*s，即阈值上限")
+    columns: int = Field(description="分块列数")
+    rows: int = Field(description="分块行数")
+    padded_columns: int = Field(description="右边补白的像素列数")
+    padded_rows: int = Field(description="下边补白的像素行数")
+    output_width: int = Field(description="输出 PNG 每行像素数（等于 columns）")
+    output_height: int = Field(description="输出 PNG 每行像素数（等于 rows）")
+    black_blocks: int = Field(description="缩略图中黑块数量")
+    black_regions: int = Field(description="缩略图黑色区域数（八邻接）")
+    enclosed_white_regions: int = Field(
+        description="缩略图被黑像素包围的白色区域数（白像素四邻接）"
+    )
+    black_one_to_one: bool = Field(description="黑色区域是否一一对应")
+    white_one_to_one: bool = Field(description="白色区域（含外部白底）是否一一对应")
+
+
+class ThumbnailResponse(BaseModel):
+    status: Literal["reduced", "keep_original"]
+    message: str
+    factor: int | None = Field(default=None, description="status=reduced 时给出最大合格倍数")
+    threshold: int | None = Field(default=None, description="status=reduced 时给出的共用阈值")
+    source: ThumbnailSourceInfo
+    thumbnail: ThumbnailGridInfo | None = Field(
+        default=None, description="status=reduced 时给出缩略图的分块与区域统计"
+    )
+    evaluated_factors: list[int] = Field(
+        default_factory=list, description="按从大到小尝试过的缩小倍数"
+    )
+    rejected: list["ThumbnailRejection"] = Field(
+        default_factory=list, description="每个未通过的倍数及原因"
+    )
+    image_base64: str | None = Field(
+        default=None,
+        description=(
+            "status=reduced 时给出缩略图 PNG 的 base64（8 位灰度、颜色类型 0、"
+            "像素仅 0/255）；status=keep_original 时为 null"
+        ),
+    )
+
+
+class ThumbnailRejection(BaseModel):
+    factor: int
+    detail: str
+
+
 class AlignResponse(BaseModel):
     status: Literal["aligned", "disconnected", "no_solution", "ambiguous"]
     layout_unique: bool
